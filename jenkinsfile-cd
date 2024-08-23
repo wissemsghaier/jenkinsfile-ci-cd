@@ -1,0 +1,346 @@
+def COMMIT_ID
+def ZIP_FILE_NAME
+pipeline {
+    agent any 
+    parameters {
+    string(name:'COMMIT_ID', defaultValue: '', description: 'Version tag')
+  } 
+    environment {
+        GO_VERSION = '1.22.5'  // Specify the Go version you are using
+        NEXUS_CREDENTIALS_ID = 'nexus-jenkins'
+        NEXUS_URL = 'https://nexus.u-cloudsolutions.xyz'
+        NEXUS_DOCKER_REPOSITORY = 'new-docker-repository'
+        NEXUS_REPOSITORY = 'student-repository'
+        GROUP_ID = 'com.artificial.GO'
+        ARTIFACT_ID = 'artifact'
+        JMETER_HOME = '/opt/apache-jmeter'  // Set the path to JMeter installation
+        JMETER_TEST_FILE = 'unzip_dir/tests/jmeter/performance-test.jmx'
+        JMETER_TEST_FILE_TMP = 'performance-test.jmx' // Nom du fichier dans le conteneur
+        JMETER_IMAGE_TAG = 'your-jmeter-image:latest'  // Docker image tag
+        
+
+
+    }
+    stages {
+        stage ("started "){
+            steps {
+                slackSend channel: "#jenkins-notifications", message: " STARTED:job  '${env.JOB_NAME} ${env.BUILD_NUMBER}' (${env.BUILD_URL})"
+            }
+        }
+        stage('Check Nexus Tag') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    echo "Commit ID: ${commitId}"
+
+                    def url = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${GROUP_ID.replace('.', '/')}/${ARTIFACT_ID}/${commitId}/${ARTIFACT_ID}-${commitId}.zip"
+                    echo "Checking URL: ${url}"
+
+                    def response = sh(script: "curl -sS -o /dev/null -w '%{http_code}' ${url}", returnStdout: true).trim()
+                    echo "HTTP Response Code: ${response}"
+
+                    if (response == '404') {
+                        error "Version tag '${commitId}' does not exist in Nexus for artifact '${GROUP_ID}:${ARTIFACT_ID}'"
+                    } else {
+                        echo "Version tag '${commitId}' exists in Nexus for artifact '${GROUP_ID}:${ARTIFACT_ID}'"
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Check Nexus Tag of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Check Nexus Tag  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Pull Code from Nexus') {
+            steps {
+                script {
+                    def commit = params.COMMIT_ID
+                    def zipFileName = "${ARTIFACT_ID}-${commit}.zip"
+                    def downloadUrl = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${GROUP_ID.replace('.', '/')}/${ARTIFACT_ID}/${commit}/${zipFileName}"
+
+                    echo "Downloading artifact from Nexus at URL: ${downloadUrl}"
+
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh """
+                            curl -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} -o ${zipFileName} "${downloadUrl}"
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Pull Code from Nexus of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Pull Code from Nexus  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Unzip Artifact') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def zipFileName = "${ARTIFACT_ID}-${commitId}.zip"
+                    def unzipDir = "unzip_dir"
+
+                    echo "Unzipping artifact: ${zipFileName}"
+
+                    sh """
+                        mkdir -p ${unzipDir}
+                        unzip -o ${zipFileName} -d ${unzipDir}
+                    """
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Unzip Artifact of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Unzip Artifact  of pipeline  failed!")
+                }
+            }
+        }
+
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def dockerfilePath = "Project-GO-GIN/Dockerfile"
+                    def unzipDir = "unzip_dir"
+
+                    echo "Building Docker image: ${dockerImageName} from Dockerfile at ${dockerfilePath}"
+
+                    sh """
+                        chown -R jenkins:jenkins ${unzipDir}
+                        docker build -t ${dockerImageName} -f ${dockerfilePath} ${unzipDir}
+                    """
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Build Docker Image of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Build Docker Image  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Publish Docker Image to Nexus') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def nexusDockerUrl = "127.0.1.1:10001/repository/${NEXUS_DOCKER_REPOSITORY}"
+
+                    echo "Publishing Docker image: ${dockerImageName} to Nexus Docker repository"
+
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh """
+                            docker login 127.0.1.1:10001 -u ${NEXUS_USERNAME} -p ${NEXUS_PASSWORD}
+                            docker tag ${dockerImageName} ${nexusDockerUrl}/${dockerImageName}
+                            docker push ${nexusDockerUrl}/${dockerImageName}
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Publish Docker Image to Nexus of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Publish Docker Image to Nexus  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Run Docker Container') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def containerName = "my-container-${commitId}"
+                    def hostPort = "9093"  // Changed host port
+                    def containerPort = "9090"
+
+                    echo "Running Docker container from image: ${dockerImageName}"
+
+                    // Optionally remove any existing container with the same name
+                    sh """
+                        docker rm -f ${containerName} || true
+                    """
+
+                    // Run the Docker container with port mapping
+                    sh """
+                        docker run -d --name ${containerName} -p ${hostPort}:${containerPort} ${dockerImageName}
+                    """
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Run Docker Container of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Run Docker Container  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Build JMeter Docker Image') {
+            steps {
+                script {
+                    echo "Building JMeter Docker image"
+
+                    // Navigate to the directory containing the Dockerfile
+                    dir('Project-GO-GIN') {
+                        // Confirm current working directory
+                        sh 'pwd'
+                
+                        // List files to confirm presence of Dockerfile
+                        sh 'ls -l'
+                
+                        // Build Docker image using the Dockerfile in the current directory
+                        sh """
+                            docker build -t ${JMETER_IMAGE_TAG} -f dockerfile .
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Build JMeter Docker Image of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Build JMeter Docker Image  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Verify Workspace Contents') {
+            steps {
+                script {
+                    echo "Listing contents of the workspace"
+                    sh 'ls -l ${WORKSPACE}'
+                    sh 'find ${WORKSPACE} -name "performance-test.jmx"'
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Verify Workspace Contents of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Verify Workspace Contents  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "Checking if JMeter test file exists..."
+
+                    // Vérifiez si le fichier existe dans l'espace de travail
+                    sh """
+                        if [ ! -f ${WORKSPACE}/${JMETER_TEST_FILE} ]; then
+                            echo "Test file ${JMETER_TEST_FILE} not found in ${WORKSPACE}"
+                            exit 1
+                        else
+                            echo "Test file ${JMETER_TEST_FILE} found."
+                        fi
+                    """
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Preparation of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Preparation  of pipeline  failed!")
+                }
+            }
+        }
+
+        stage('Run JMeter Performance Test') {
+            steps {
+                script {
+                    echo "Starting JMeter performance tests"
+
+                    // Exécuter les tests JMeter à l'intérieur du conteneur
+                    docker.image("${JMETER_IMAGE_TAG}").inside {
+                        // Créer le répertoire cible avant de copier le fichier
+                        sh """
+                            mkdir -p /tmp/unzip_dir/tests/jmeter
+                        """
+
+                        // Copier le fichier de test JMeter depuis l'espace de travail Jenkins dans le conteneur
+                        sh """
+                            cp ${WORKSPACE}/${JMETER_TEST_FILE} /tmp/unzip_dir/tests/jmeter/${JMETER_TEST_FILE_TMP}
+                        """
+
+                        // Exécuter le test JMeter
+                        sh """
+                            jmeter -n -t /tmp/unzip_dir/tests/jmeter/${JMETER_TEST_FILE_TMP} -l /tmp/jmeter-results.jtl
+                        """
+                    
+                        // Copier les résultats de retour dans l'espace de travail Jenkins
+                        sh """
+                            cp /tmp/jmeter-results.jtl ${WORKSPACE}/jmeter-results.jtl
+                        """
+                    }
+
+                    // Archiver les résultats pour une analyse ultérieure
+                    archiveArtifacts artifacts: 'jmeter-results.jtl', allowEmptyArchive: true
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Run JMeter Performance Test of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Run JMeter Performance Test  of pipeline  failed!")
+                }
+            }
+        }
+        stage('Stop and Remove Docker Container') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def containerName = "my-container-${commitId}"
+
+                    echo "Stopping Docker container: ${containerName}"
+
+                    // Stop and remove the Docker container
+                    sh """
+                        docker stop ${containerName} || true
+                        docker rm ${containerName} || true
+                    """
+                }
+            }
+            post {
+                success {
+                    slackSend (color: 'good', message: "Stop and Remove Docker Container of pipeline  succeeded!")
+                }
+                failure {
+                    slackSend (color: 'danger', message: "Stop and Remove Docker Container  of pipeline  failed!")
+                }
+            }
+        }
+
+
+    }
+    post {
+        always {      
+            cleanWs()      
+        }  
+        success {
+            slackSend channel: '#jenkins-alerts-pfe-2023', message: " build ${currentBuild.result} for job ${env.JOB_NAME} #${env.BUILD_NUMBER} (duration: ${currentBuild.durationString}). Check out the build at ${env.BUILD_URL}"
+        }
+        failure {
+            slackSend channel: '#jenkins-alerts-pfe-2023', message: "Build ${currentBuild.result} for ${env.JOB_NAME} #${env.BUILD_NUMBER} (duration: ${currentBuild.durationString}). Check out the build at ${env.BUILD_URL}"  
+        }
+    }
+    
+}
+
+
